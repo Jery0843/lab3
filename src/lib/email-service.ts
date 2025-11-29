@@ -62,8 +62,52 @@ export class EmailService {
       }
     }
 
-    // Fallback to Brevo
+    // Fallback to QStash
+    const qstashResult = await this.sendEmailViaQStash(emailData);
+    if (qstashResult) return true;
+
+    // Final fallback to Brevo
     return this.sendEmailViaBrevo(emailData);
+  }
+
+  private async sendEmailViaQStash(emailData: EmailData): Promise<boolean> {
+    const qstashToken = process.env.QSTASH_TOKEN;
+    
+    if (!qstashToken) {
+      console.warn('QStash token not configured');
+      return false;
+    }
+    
+    try {
+      const response = await fetch('https://qstash.upstash.io/v2/publish/https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${qstashToken}`,
+          'Content-Type': 'application/json',
+          'Upstash-Forward-accept': 'application/json',
+          'Upstash-Forward-api-key': process.env.BREVO_API_KEY || '',
+          'Upstash-Forward-content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          sender: { name: "0xJerry's Lab", email: "noreply@jerome.co.in" },
+          to: [{ email: emailData.to, name: emailData.to.split('@')[0] }],
+          subject: emailData.subject,
+          htmlContent: emailData.html
+        })
+      });
+
+      if (response.ok) {
+        console.log('Email queued via QStash');
+        return true;
+      }
+
+      const error = await response.text();
+      console.error('QStash failed:', error);
+      return false;
+    } catch (error) {
+      console.error('QStash error:', error);
+      return false;
+    }
   }
 
   private async sendEmailViaBrevo(emailData: EmailData): Promise<boolean> {
