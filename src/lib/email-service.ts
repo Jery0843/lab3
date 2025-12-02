@@ -14,10 +14,52 @@ export class EmailService {
   private mailjetSecretKey = process.env.MAILJET_SECRET_KEY || '';
   private resendApiKey = process.env.RESEND_API_KEY || '';
   private brevoApiKey = process.env.BREVO_API_KEY || '';
+  private mailjetCount = 0;
+  private mailjetLimit = 200;
 
-  private async sendEmail(emailData: EmailData): Promise<boolean> {
-    const mailjetResult = await this.sendEmailViaMailjet(emailData);
-    if (mailjetResult) return true;
+  constructor() {
+    this.loadMailjetCount();
+  }
+
+  private async loadMailjetCount() {
+    try {
+      const db = getDatabase();
+      if (!db) return;
+
+      const today = new Date().toISOString().split('T')[0];
+      const result = await db.prepare('SELECT count FROM email_quota WHERE service = ? AND date = ?').bind('mailjet', today).first() as { count: number } | null;
+      
+      if (result) {
+        this.mailjetCount = result.count;
+        console.log(`Mailjet quota loaded: ${this.mailjetCount}/${this.mailjetLimit}`);
+      }
+    } catch (error) {
+      console.error('Error loading Mailjet count:', error);
+    }
+  }
+
+  private async saveMailjetCount() {
+    try {
+      const db = getDatabase();
+      if (!db) return;
+
+      const today = new Date().toISOString().split('T')[0];
+      await db.prepare('INSERT OR REPLACE INTO email_quota (service, date, count) VALUES (?, ?, ?)').bind('mailjet', today, this.mailjetCount).run();
+    } catch (error) {
+      console.error('Error saving Mailjet count:', error);
+    }
+  }
+
+  private async sendEmail(emailData: EmailData, useMailjet = true): Promise<boolean> {
+    if (useMailjet && this.mailjetCount < this.mailjetLimit) {
+      const mailjetResult = await this.sendEmailViaMailjet(emailData);
+      if (mailjetResult) {
+        this.mailjetCount++;
+        await this.saveMailjetCount();
+        console.log(`Mailjet: ${this.mailjetCount}/${this.mailjetLimit}`);
+        return true;
+      }
+    }
 
     const resendResult = await this.sendEmailViaResend(emailData);
     if (resendResult) return true;
@@ -56,6 +98,11 @@ export class EmailService {
         const result = await response.json();
         console.log('Email sent via Mailjet:', result.Messages[0].Status);
         return true;
+      }
+
+      if (response.status === 429 || response.status === 403) {
+        console.log('Mailjet rate limit reached, disabling for this session');
+        this.mailjetCount = this.mailjetLimit;
       }
 
       console.error('Mailjet failed:', await response.text());
@@ -253,34 +300,39 @@ export class EmailService {
 
     const maxEmails = Math.min(allEmails.length, 300);
     const emailsToSend = allEmails.slice(0, maxEmails);
-    const batch1Size = 80;
     
-    console.log(`Sending ${emailsToSend.length}/${allEmails.length} emails in 2 batches`);
+    const mailjetAvailable = this.mailjetLimit - this.mailjetCount;
+    const mailjetBatch = emailsToSend.slice(0, Math.min(mailjetAvailable, emailsToSend.length));
+    const resendBatch = emailsToSend.slice(mailjetBatch.length);
+    
+    console.log(`Sending ${emailsToSend.length} emails: ${mailjetBatch.length} via Mailjet, ${resendBatch.length} via Resend/Brevo`);
     
     let totalSuccess = 0;
     
-    try {
-      const batch1 = emailsToSend.slice(0, batch1Size);
-      const results1 = await Promise.allSettled(
-        batch1.map(recipient => this.sendEmail({ to: recipient.email, subject, html }))
-      );
-      const successful1 = results1.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
-      totalSuccess += successful1;
-      console.log(`Batch 1: ${successful1}/${batch1.length} emails sent`);
-    } catch (error) {
-      console.error('Batch 1 error:', error);
+    if (mailjetBatch.length > 0) {
+      try {
+        const results1 = await Promise.allSettled(
+          mailjetBatch.map(recipient => this.sendEmail({ to: recipient.email, subject, html }, true))
+        );
+        const successful1 = results1.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
+        totalSuccess += successful1;
+        console.log(`Mailjet: ${successful1}/${mailjetBatch.length} sent`);
+      } catch (error) {
+        console.error('Mailjet batch error:', error);
+      }
     }
     
-    try {
-      const batch2 = emailsToSend.slice(batch1Size);
-      const results2 = await Promise.allSettled(
-        batch2.map(recipient => this.sendEmail({ to: recipient.email, subject, html }))
-      );
-      const successful2 = results2.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
-      totalSuccess += successful2;
-      console.log(`Batch 2: ${successful2}/${batch2.length} emails sent`);
-    } catch (error) {
-      console.error('Batch 2 error:', error);
+    if (resendBatch.length > 0) {
+      try {
+        const results2 = await Promise.allSettled(
+          resendBatch.map(recipient => this.sendEmail({ to: recipient.email, subject, html }, false))
+        );
+        const successful2 = results2.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
+        totalSuccess += successful2;
+        console.log(`Resend/Brevo: ${successful2}/${resendBatch.length} sent`);
+      } catch (error) {
+        console.error('Resend/Brevo batch error:', error);
+      }
     }
 
     console.log(`Completed: ${totalSuccess}/${emailsToSend.length} emails sent`);
@@ -406,34 +458,39 @@ export class EmailService {
 
     const maxEmails = Math.min(allEmails.length, 300);
     const emailsToSend = allEmails.slice(0, maxEmails);
-    const batch1Size = 80;
     
-    console.log(`Sending ${emailsToSend.length}/${allEmails.length} emails in 2 batches`);
+    const mailjetAvailable = this.mailjetLimit - this.mailjetCount;
+    const mailjetBatch = emailsToSend.slice(0, Math.min(mailjetAvailable, emailsToSend.length));
+    const resendBatch = emailsToSend.slice(mailjetBatch.length);
+    
+    console.log(`Sending ${emailsToSend.length} emails: ${mailjetBatch.length} via Mailjet, ${resendBatch.length} via Resend/Brevo`);
     
     let totalSuccess = 0;
     
-    try {
-      const batch1 = emailsToSend.slice(0, batch1Size);
-      const results1 = await Promise.allSettled(
-        batch1.map(recipient => this.sendEmail({ to: recipient.email, subject, html }))
-      );
-      const successful1 = results1.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
-      totalSuccess += successful1;
-      console.log(`Batch 1: ${successful1}/${batch1.length} emails sent`);
-    } catch (error) {
-      console.error('Batch 1 error:', error);
+    if (mailjetBatch.length > 0) {
+      try {
+        const results1 = await Promise.allSettled(
+          mailjetBatch.map(recipient => this.sendEmail({ to: recipient.email, subject, html }, true))
+        );
+        const successful1 = results1.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
+        totalSuccess += successful1;
+        console.log(`Mailjet: ${successful1}/${mailjetBatch.length} sent`);
+      } catch (error) {
+        console.error('Mailjet batch error:', error);
+      }
     }
     
-    try {
-      const batch2 = emailsToSend.slice(batch1Size);
-      const results2 = await Promise.allSettled(
-        batch2.map(recipient => this.sendEmail({ to: recipient.email, subject, html }))
-      );
-      const successful2 = results2.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
-      totalSuccess += successful2;
-      console.log(`Batch 2: ${successful2}/${batch2.length} emails sent`);
-    } catch (error) {
-      console.error('Batch 2 error:', error);
+    if (resendBatch.length > 0) {
+      try {
+        const results2 = await Promise.allSettled(
+          resendBatch.map(recipient => this.sendEmail({ to: recipient.email, subject, html }, false))
+        );
+        const successful2 = results2.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value).length;
+        totalSuccess += successful2;
+        console.log(`Resend/Brevo: ${successful2}/${resendBatch.length} sent`);
+      } catch (error) {
+        console.error('Resend/Brevo batch error:', error);
+      }
     }
 
     console.log(`Completed: ${totalSuccess}/${emailsToSend.length} emails sent`);
